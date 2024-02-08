@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import args
 
 
 class PositionalEncoding(nn.Module):
@@ -25,14 +26,17 @@ class TransformerEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dim_feedforward=dim_feedforward, batch_first=True), num_layers=num_layers)
         self.pos_encoder = PositionalEncoding(d_model)
-        self.fc = nn.Linear(d_model, output_dim)
+        self.fc = nn.Linear(3*d_model, output_dim)
 
     def forward(self, x):
         x = self.pos_encoder(x)
 
         x = self.transformer_encoder(x)
-
-        x = F.relu(self.fc(x.view(x.size(0), -1)))
+        x_mean = x.mean(dim=1)
+        x_sum = x.sum(dim=1)
+        x_max, _ = x.max(dim=1)
+        x = torch.cat((x_mean, x_sum, x_max), 1)
+        x = F.relu(self.fc(x))
         return x
 
 
@@ -153,16 +157,16 @@ class Model(nn.Module):
         atk = nn.utils.rnn.pad_sequence(ns if len(
             ns) else torch.repeat_interleave(torch.Tensor([0]), len(x)), True)
 
-        try:
-            own[..., 0] = torch.sum(atk, -1)
-        except:
-            breakpoint()
+        own[..., 0] = torch.sum(atk, -1)
         opp[..., 0] = -own[..., 0]
         atk = torch.unsqueeze(atk, -1)
 
-        own = torch.tensor(own, dtype=torch.float).to(torch.device("cuda"))
-        opp = torch.tensor(opp, dtype=torch.float).to(torch.device("cuda"))
-        atk = atk.to(torch.device("cuda"))
+        own = torch.tensor(own, dtype=torch.float)
+        opp = torch.tensor(opp, dtype=torch.float)
+        if args.gpu:
+            opp = opp.to(torch.device("cuda"))
+            own = own.to(torch.device("cuda"))
+            atk = atk.to(torch.device("cuda"))
 
         atk_out = self.atk_trans(atk)
         own_out = self.boardm(own)
@@ -203,9 +207,12 @@ class Model(nn.Module):
         return x
 
     def backward(self, x1, y1, x2, y2):
-        y1, y2 = map(torch.tensor, (y1, y2))
+        y1, y2 = torch.tensor(y1), torch.tensor(y2)
+        if args.gpu:
+            y1, y2 = y1.to(torch.device("cuda")), y2.to(torch.device("cuda"))
         loss = (torch.nanmean(x1*y1)+torch.nanmean(x2*y2))/2
         loss.backward()
 
         self.optimizer.step()
         self.optimizer.zero_grad()
+        return loss.item()

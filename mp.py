@@ -1,18 +1,21 @@
 
 import numpy as np
-import multiprocessing as mp
+import torch.multiprocessing as mp
+from multiprocessing.connection import wait
 import sim
-from multiprocessing import Pipe, Process
+from torch.multiprocessing import Pipe, Process
 from tree import MCTS
 from torch import no_grad
+import args
+import gc
 
 
 class manager:
     def __init__(self, nenvs, seed, render, states) -> None:
         cpus = mp.cpu_count()
         try:
-            assert nenvs % cpus == 0 or nenvs < cpus and nenvs % 2 == 0
-            self.nenvs = nenvs//2
+            assert nenvs % cpus == 0 or nenvs < cpus
+            self.nenvs = nenvs
         except:
             print("setting nenvs to 1")
             self.nenvs = 1
@@ -23,7 +26,7 @@ class manager:
         self.q = states
         self.remotes, self.work_remotes = zip(
             *[Pipe() for _ in range(self.nremotes)])
-        self.ps = [Process(target=gather_data, args=(work_remote, remote, seeds, self.q, seeds == seed and render))
+        self.ps = [Process(target=gather_data, args=(work_remote, remote, seeds, self.q, seeds == seed & render))
                    for work_remote, remote, seeds in zip(self.work_remotes, self.remotes, env_seeds)]
         for p in self.ps:
             p.daemon = True
@@ -33,7 +36,6 @@ class manager:
             remote.close()
 
     def send(self, actions):
-        actions = actions.numpy()
         actions = np.array_split(actions, self.nremotes)
         for remote, action in zip(self.remotes, actions):
             remote.send(('step', action))
@@ -98,7 +100,7 @@ class envc:
         lose = x[0] == 127 or (atk[0] and max_spike)
         win = x[0] == 126 or (max_spike and not atk[0])
         self.a += 1
-        is_terminal = self.a >= 10  # win or lose
+        is_terminal = self.a >= 10 if args.debug else win or lose
         if is_terminal:
             self.a = 0
 
@@ -116,7 +118,7 @@ class envc:
         else:
             b, c = self.x.get_hidden()
             self.states.append(
-                ((x, atk), (np.concatenate([x[:222], x[738:960]]), b, c, len(atk[1]), atk[1])))
+                ((x, atk), (np.concatenate([x[:222], x[738:960]]), b, c, sum(atk[1])*(-1 if atk[0] else 1), atk[1])))
 
             for i, r in enumerate((x[0], x[738])):
                 if r != 125:
@@ -141,7 +143,9 @@ class envc:
             self.rt = True
 
     def render(self):
-        self.r.render(self.x)
+        r = self.r.render(self.x)
+        if r:
+            self.render_toggle()
 
     def set_state(self, x):
         if type(x) == tuple:
@@ -157,7 +161,7 @@ class envc:
 
 def gather_data(remote, parent_remote, seeds, q, render):
     parent_remote.close()
-    envs = [envc(seed, q, i == 0 and render) for i, seed in enumerate(seeds)]
+    envs = [envc(seed, q, r) for r, seed in zip(render, seeds)]
     remote.send([env.no_step() for env in envs])
     try:
         while True:
@@ -200,12 +204,12 @@ class TreeMan:
         self.nn = nn
 
         try:
-            assert nenvs % cpus == 0 or nenvs < cpus and nenvs % 2 == 0
-            self.nenvs = nenvs//2
+            assert nenvs % cpus == 0 or nenvs < cpus
+            self.nenvs = nenvs
         except:
             print("setting nenvs to 1")
             self.nenvs = 1
-        self.nremotes = min(cpus, self.nenvs)
+        self.nremotes = min(cpus, self.nenvs, len(to_process))
         self.trees = [(MCTS(i == 0 and render), i)
                       for i in range(self.nremotes)]
         self.states = list([None]*self.nremotes)
@@ -223,31 +227,54 @@ class TreeMan:
         for p in self.ps:
             p.start()
         self.to_process = to_process[self.nremotes:]
+        self.next = self.nremotes
         for remote in self.work_remotes:
             remote.close()
+        print("inited", end=" ", flush=True)
 
     def recv(self):
-        states, atk, _ = map(list, zip(
-            *[remote.recv()
-              for remote in self.remotes]))
-        x = len(states)-1
-        for i, s in enumerate(reversed(states)):
-            if s is None:
+        ready_list = wait(self.remotes, 1)
+        if not ready_list:
+            return
+        try:
+            states, atk = map(list, zip(*[remote.recv()
+                              for remote in ready_list]))
+        except:
+            return
+        indices = [i for i, x in enumerate(states) if x is None]
+        for i in reversed(indices):
+            while len(states) and states[i] is None:
                 if len(self.to_process):
-                    self.remotes[x-i].send(self.to_process[0])
+                    ready_list[i].send((self.to_process[0], self.next))
+                    self.next += 1
                     self.to_process = self.to_process[1:]
+                    ready = ready_list[i].poll(1)
+                    if ready:
+                        states[i], atk[i] = ready_list[i].recv()
+                    else:
+                        del atk[i]
+                        del states[i]
+                        del ready_list[i]
+                        break
                 else:
-                    del atk[x-i]
-                    del states[x-i]
-                    self.remotes[x-i].send(None)
-                    self.remotes[x-i].close()
-                    del self.remotes[x-i]
+                    del atk[i]
+                    del states[i]
+                    ready_list[i].send((None, None))
+                    ready_list[i].close()
+                    self.remotes.remove(ready_list[i])
+                    del ready_list[i]
+                    break
+            print(len(self.to_process), end=" ", flush=True)
 
+            gc.collect()
         if len(atk):
             with no_grad():
                 acs = self.nn(states, atk, p2=True)
-                acs = acs.cpu().reshape(-1, 2)
-            for r, a in zip(self.remotes, acs):
+                acs = acs.detach()
+                if args.gpu:
+                    acs = acs.cpu()
+                acs = acs.numpy().reshape(-1, 2)
+            for r, a in zip(ready_list, acs):
                 r.send(a)
 
     def close(self):
@@ -257,11 +284,21 @@ class TreeMan:
 
 def tree_gather(remote, parent_remote, trees, q, states, budget):
     parent_remote.close()
+    tree, c = trees
+
     try:
         while True:
-            trees[0].search(states, q, trees[1], remote, budget)
-            states = remote.recv()
+            tree.search(states, q, c, remote, budget)
+            states, c = remote.recv()
+            gc.collect()
+
             if not states:
+                remote.close()
+                del tree
+                """try:
+                    remote.send((None, None))
+                except:
+                    break"""
                 break
     except KeyboardInterrupt:
         pass
