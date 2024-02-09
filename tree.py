@@ -113,7 +113,7 @@ class MCTS:
 
     def rollout(self, state, depth):
         is_terminal = False
-        reward = [0, 0]
+        reward = np.array([0., 0.])
 
         while not is_terminal:
             depth += 1
@@ -133,7 +133,6 @@ class MCTS:
                         self.render = False
                         self.r.close()
                         del self.r
-            else:
                 for i, r in enumerate((x[0], x[738])):
                     if r != 125:
                         lines = (r % 10)//2
@@ -145,8 +144,8 @@ class MCTS:
                     else:
                         reward[i] += -0.2
 
-        reward += [1, -0.5] if win else [-0.5,
-                                         1] if x[738] == 126 else [-0.5, -0.5]
+        reward += [1., -0.5] if win else [-0.5,
+                                          1.] if x[738] == 126 else [-0.5, -0.5]
 
         return map(lambda x: x/depth, reward)
 

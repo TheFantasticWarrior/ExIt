@@ -286,22 +286,19 @@ def tree_gather(remote, parent_remote, trees, q, states, budget):
     parent_remote.close()
     tree, c = trees
 
-    try:
-        while True:
-            tree.search(states, q, c, remote, budget)
-            states, c = remote.recv()
-            gc.collect()
+    while True:
+        tree.search(states, q, c, remote, budget)
+        states, c = remote.recv()
+        gc.collect()
 
-            if not states:
-                remote.close()
-                del tree
-                """try:
-                    remote.send((None, None))
-                except:
-                    break"""
-                break
-    except KeyboardInterrupt:
-        pass
+        if not states:
+            remote.close()
+            del tree
+            """try:
+                remote.send((None, None))
+            except:
+                break"""
+            break
 
 
 def _flatten_obs(obs):

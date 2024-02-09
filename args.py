@@ -8,7 +8,7 @@ action_space = 10
 seed = 1
 render = True
 nenvs = 16
-ntrees = 10
+ntrees = 7
 
 total_timesteps = 1e9
 samplesperbatch = 64 if debug else 256

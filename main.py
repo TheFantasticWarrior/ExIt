@@ -4,6 +4,8 @@ from mp import manager, TreeMan
 import torch.multiprocessing as mp
 import torch
 import gc
+from hanging_threads import start_monitoring
+
 if __name__ == "__main__":
     ip = initial_policy()
     if args.load:
@@ -35,10 +37,13 @@ if __name__ == "__main__":
             s += sample_self_play(ip, m)
             ds, state = get_random(s, args.samplesperbatch)
             print("tree", end=" ", flush=True)
+            sm = start_monitoring(20, 1000)
             tm = TreeMan(ip, args.ntrees, state, results,
                          args.tree_iterations, args.render)
             while tm.remotes:
                 tm.recv()
+            sm.stop()
+
             tm.close()
             loss = train_policy(ds, list(results), ip)
             print(f"Loop {i} ended, {loss=}")
