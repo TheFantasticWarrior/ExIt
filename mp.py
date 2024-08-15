@@ -2,16 +2,15 @@
 import numpy as np
 import torch.multiprocessing as mp
 from multiprocessing.connection import wait
-import sim
-from torch.multiprocessing import Pipe, Process
+import tetris
+from torch.multiprocessing import Pipe, Process,Manager,Array
 from tree import MCTS
 from torch import no_grad
 import args
-import gc
 
 
 class manager:
-    def __init__(self, nenvs, seed, render, states) -> None:
+    def __init__(self, nenvs, seed, render) -> None:
         cpus = mp.cpu_count()
         try:
             assert nenvs % cpus == 0 or nenvs < cpus
@@ -20,18 +19,22 @@ class manager:
             print("setting nenvs to 1")
             self.nenvs = 1
         self.nremotes = min(cpus, self.nenvs)
-        self.seeds = np.arange(self.nenvs)+seed
+        self.seeds = np.arange(self.nenvs)
         # self.envs=[make_env(seed+i) for i in range(nenvs)]
         env_seeds = np.array_split(self.seeds, self.nremotes)
-        self.q = states
+        self.mn=Manager()
+        self.q = self.mn.list()
+        self.lock=self.mn.Lock()
+        self.data=Array("d",500*self.nenvs,lock=False)
         self.remotes, self.work_remotes = zip(
             *[Pipe() for _ in range(self.nremotes)])
-        self.ps = [Process(target=gather_data, args=(work_remote, remote, seeds, self.q, seeds == seed & render))
+        self.ps = [Process(target=gather_data, args=(work_remote, remote, seeds, self.q, seeds == 0 & render,self.lock,self.data,seed))
                    for work_remote, remote, seeds in zip(self.work_remotes, self.remotes, env_seeds)]
         for p in self.ps:
             p.daemon = True
             p.start()
-
+        self.count=0
+        self.lines=0
         for remote in self.work_remotes:
             remote.close()
 
@@ -42,10 +45,13 @@ class manager:
 
     def recv(self):
         results = [remote.recv() for remote in self.remotes]
-        results = _flatten_list(results)
-        a, b, c = zip(*results)
+        if results[0] is None:
+            return
+        c = _flatten_list(results)
 
-        return _flatten_obs(a).reshape(-1, 1476), b, c
+        c=np.stack(c)
+        self.count+=c.size - np.count_nonzero(np.isnan(c))
+        self.lines+=np.nansum(c) if self.count else 0
 
     def render_toggle(self):
         self.remotes[0].send(("render", None))
@@ -72,66 +78,71 @@ class manager:
         for p in self.ps:
             p.join()
 
-
 class envc:
-    def __init__(self, seed, q, render=False):
-        x = sim.Container()
+    def __init__(self, seed,i,shared_arr, q,lock, render=False):
+        self.share = np.frombuffer(shared_arr)[i*500:(i+1)*500]
+        x = tetris.Container()
         x.seed_reset(seed)
         self.states = []
         self.x = x
         if render:
-            self.r = sim.Renderer(1, 20)
+            self.r = tetris.Renderer(1, 20)
             self.rt = True
         else:
             self.rt = False
         self.q = q
-        self.a = 0
+        self.total_lines=np.array([0,0])
+        self.lock=lock
+
 
     def no_step(self):
-        x = self.x.get_state()
-        return x, self.x.get_atk(), [x[0], x[738]]
-
+        self.share[:] = self.x.get_state()
     def step_both(self, a):
         self.x.step(a[0], a[1])
         x = self.x.get_state()
-        atk = self.x.get_atk()
-        reward = [0, 0]
-        max_spike = sum(atk[1]) >= 30
-        lose = x[0] == 127 or (atk[0] and max_spike)
-        win = x[0] == 126 or (max_spike and not atk[0])
-        self.a += 1
-        is_terminal = self.a >= 10 if args.debug else win or lose
+        reward =np.array([0, 0])
+
+        lose = x[0] == 127 or x[464]<-30
+        win = x[0] == 126 or x[464]>30
+        is_terminal = win or lose
         if is_terminal:
-            self.a = 0
 
-            self.end_reward = [1, -0.5] if win else [-0.5,
-                                                     1] if x[738] == 126 else [-0.5, -0.5]
-
+            #end_reward = [1, -0.5] if win else [-0.5, 1] if x[738] == 126 else [-0.5, -0.5]
+            #self.total_reward+=end_reward
             state = self.states[np.random.randint(len(self.states))]
             self.states = []
             self.x.reset()
-            x = self.x.get_state()
-            atk = self.x.get_atk()
-            self.q.append(state)
+            self.share[:] = self.x.get_state()
+            with self.lock:
+                self.q.append(state)
 
-            return x, atk, (1, self.end_reward)
+            return self.total_lines
         else:
-            b, c = self.x.get_hidden()
-            self.states.append(
-                ((x, atk), (np.concatenate([x[:222], x[738:960]]), b, c, sum(atk[1])*(-1 if atk[0] else 1), atk[1])))
-
-            for i, r in enumerate((x[0], x[738])):
+            self.share[:]=x
+            self.states.append(self.x.copy())
+            for i in range(2):
+                r=x[232*i]
+                self.total_lines[i]+=(r % 10)//2 if r!=125 else 0
+            """
+            for i, (r,g) in enumerate(((x[0], x[232]),(x[5],x[237]))):
                 if r != 125:
                     lines = (r % 10)//2
-                    satk = r//10
-                    reward[i] += (0.01 if a[i] ==
-                                  1 else (0.1 if x[i*738+5] == 5 else 0.001))*(r % 2)
-                    reward[i] += ((0.5 if satk >= lines*2+2 and lines <
-                                  4 else 0.3 if lines < 4 else 0.25)*(lines+1.5*satk)**1.2)/20
-                else:
-                    reward[i] = -0.2
+                    #satk = r//10
+                    # hard drop without breaking b2b or spin
+                    #reward[i] += (0.15 if a[i] == 1 else
+                                  (0.2 if x[i*232+8] == 5 else 0.1))*(r % 2)
+                    # t spin, regular, tetris
+                    #reward[i] += ((1 if satk >= lines*2+2 and lines <4
+                                   else 0.3 if lines < 4 else 0.5)*
+                                  (lines+1.5*satk)**1.2)/5
+                    # garbage
+                    #reward[i]+=g*0.5
 
-            return x, atk, reward
+                    self.total_lines[i]+=lines
+                #else:
+                    #reward[i] = -0.2
+            """
+            return np.array([np.nan,np.nan])
 
     def render_toggle(self):
         if self.rt:
@@ -139,7 +150,7 @@ class envc:
             self.r.close()
             self.r = None
         else:
-            self.r = sim.Renderer(1, 20)
+            self.r = tetris.Renderer(1, 20)
             self.rt = True
 
     def render(self):
@@ -149,40 +160,37 @@ class envc:
 
     def set_state(self, x):
         if type(x) == tuple:
-            self.x = sim.Container(x)
+            self.x = tetris.Container(x)
         else:
             self.x = x.copy()
-        return self.x.get_state(), self.x.get_atk()
+        return self.x.get_state()
 
     def close(self):
         if self.rt:
             self.r.close()
 
 
-def gather_data(remote, parent_remote, seeds, q, render):
+def gather_data(remote, parent_remote, i, q, render,lock,data,seed):
     parent_remote.close()
-    envs = [envc(seed, q, r) for r, seed in zip(render, seeds)]
-    remote.send([env.no_step() for env in envs])
+    envs = [envc(seed,order,data, q, lock,r) for r, order in zip(render, i)]
+    for env in envs:
+        env.no_step()
+    remote.send(None)
     try:
         while True:
             cmd, data = remote.recv()
             if cmd == 'step':
                 actions = data
                 actions = actions.reshape(-1, 2)
-                data = [env.step_both(action)
-                        for env, action in zip(envs, actions)]
-                remote.send(data)
+                remote.send([env.step_both(action)
+                for env, action in zip(envs, actions)])
 
                 if envs[0].rt:
                     envs[0].render()
-
-            elif cmd == "to_state":
-                state, i = data
-
-                remote.send(envs[i].set_state(state))
-
             elif cmd == 'reset':
-                remote.send([env.reset() for env in envs])
+                for env in envs:
+                    env.reset()
+                remote.send(None)
             elif cmd == 'render':
                 envs[0].render_toggle()
             elif cmd == 'close':
@@ -190,114 +198,128 @@ def gather_data(remote, parent_remote, seeds, q, render):
                     env.close()
                 remote.close()
                 break
+            """
+            elif cmd == "to_state":
+                state, i = data
+
+                remote.send(envs[i].set_state(state))
+            """
 
     except KeyboardInterrupt:
         pass
+    except:
+        raise
     finally:
         for env in envs:
             env.close()
 
 
 class TreeMan:
-    def __init__(self, nn, nenvs, to_process, results, budget, render=False) -> None:
+    def __init__(self, nn, nenvs, to_process, results,budget,lock,render=False) -> None:
         cpus = mp.cpu_count()
         self.nn = nn
-
         try:
             assert nenvs % cpus == 0 or nenvs < cpus
             self.nenvs = nenvs
         except:
             print("setting nenvs to 1")
             self.nenvs = 1
-        self.nremotes = min(cpus, self.nenvs, len(to_process))
-        self.trees = [(MCTS(i == 0 and render), i)
+        self.nremotes = min(self.nenvs, len(to_process))
+        print(self.nremotes,"workers")
+        self.data=Array("d",500*self.nremotes,lock=False)
+        self.trees = [MCTS(i,render,self.data,results,lock)
                       for i in range(self.nremotes)]
-        self.states = list([None]*self.nremotes)
-        self.atk = list([None]*self.nremotes)
-        self.tremotes = list([None]*self.nremotes)
         env_trees = self.trees  # np.array_split(self.trees, self.nremotes)
         # np.array_split(states, self.nremotes)
-        self.q = results
-        self.loc = list()
+        self.q =results
         self.remotes, self.work_remotes = zip(
-            *[Pipe() for _ in range(self.nremotes)])
-        self.remotes = list(self.remotes)
-        self.ps = [Process(target=tree_gather, args=(work_remote, remote, tree, self.q, states, budget))
-                   for work_remote, remote, tree, states in zip(self.work_remotes, self.remotes, env_trees, to_process)]
+        *[Pipe() for _ in range(self.nremotes)])
+        self.ps = [Process(target=tree_gather, args=(work_remote, remote, tree,states,self.q, budget,self.nn==None))
+            for work_remote, remote, tree, states in zip(self.work_remotes, self.remotes, env_trees, to_process)]
         for p in self.ps:
             p.start()
         self.to_process = to_process[self.nremotes:]
-        self.next = self.nremotes
+        self.remotes = list(self.remotes)
         for remote in self.work_remotes:
             remote.close()
-        print("inited", end=" ", flush=True)
-
+        #print("inited", end=" ", flush=True)
+    def run(self):
+        while self.remotes:
+            self.recv()
+        self.close()
     def recv(self):
-        ready_list = wait(self.remotes, 1)
+        ready_list = wait(self.remotes, 0.1)
         if not ready_list:
             return
         try:
-            states, atk = map(list, zip(*[remote.recv()
-                              for remote in ready_list]))
+            x=zip(*[remote.recv() for remote in ready_list])
         except:
+            self.remotes=[]
             return
-        indices = [i for i, x in enumerate(states) if x is None]
-        for i in reversed(indices):
-            while len(states) and states[i] is None:
-                if len(self.to_process):
-                    ready_list[i].send((self.to_process[0], self.next))
-                    self.next += 1
-                    self.to_process = self.to_process[1:]
-                    ready = ready_list[i].poll(1)
-                    if ready:
-                        states[i], atk[i] = ready_list[i].recv()
-                    else:
-                        del atk[i]
-                        del states[i]
-                        del ready_list[i]
-                        break
-                else:
-                    del atk[i]
-                    del states[i]
-                    ready_list[i].send((None, None))
-                    ready_list[i].close()
-                    self.remotes.remove(ready_list[i])
-                    del ready_list[i]
-                    break
-            print(len(self.to_process), end=" ", flush=True)
+        if x is None:
+            return
+        states,masks =map(list,x)
+        """
+        normal: index of tree,mask
+        finalize: list of states,None
+        done: None,None
+        """
+        finalize_indices = [i for i, mask in enumerate(masks) if mask is None]
+        process_indices = [i for i, mask in enumerate(masks) if mask is not None]
 
-            gc.collect()
-        if len(atk):
+        if process_indices:
+            states_to_process = [states[i] for i in process_indices]
+            masks_to_process = [masks[i] for i in process_indices]
+            remotes_to_process = [ready_list[i] for i in process_indices]
+
+            mask_batch = np.stack(masks_to_process, axis=0)
+            state_batch = [self.data[s*500:(s+1)*500] for s in states_to_process]
+
             with no_grad():
-                acs = self.nn(states, atk, p2=True)
+                acs = self.nn(state_batch, p2=True, mask=mask_batch)
                 acs = acs.detach()
                 if args.gpu:
                     acs = acs.cpu()
                 acs = acs.numpy().reshape(-1, 2)
-            for r, a in zip(ready_list, acs):
-                r.send(a)
+
+            for remote, ac in zip(remotes_to_process, acs):
+                remote.send(ac)
+        # Process finalized states
+        for i in finalize_indices:
+            if isinstance(states[i], list):
+                with no_grad():
+                    result = self.nn(states[i], p2=True, loss=True)
+                    ready_list[i].send(tuple(map(lambda x: x.cpu().numpy(), result)))
+            else:
+                if self.to_process:#args.samplesperbatch > len(self.q) + 1 and
+                    ready_list[i].send(self.to_process.pop(0))
+                else:
+                    ready_list[i].send(None)
+                    ready_list[i].close()
+                    idx=self.remotes.index(ready_list[i])
+                    del self.remotes[idx]
+                    self.ps[idx].join()
+                    del self.ps[idx]
+            print(f"{len(self.q)}/{args.samplesperbatch}", end=" ", flush=True)
 
     def close(self):
         for p in self.ps:
             p.join()
+        print()
 
-
-def tree_gather(remote, parent_remote, trees, q, states, budget):
+def tree_gather(remote, parent_remote, tree,states, q, budget,rand):
     parent_remote.close()
-    tree, c = trees
-
     while True:
-        tree.search(states, q, c, remote, budget)
-        states, c = remote.recv()
-        gc.collect()
+        if rand:
+            tree.search(states, q, None, budget)
+        else:
+            tree.search(states, q, remote, budget)
+        remote.send((None,None))
+        states = remote.recv()
 
         if not states:
             remote.close()
             del tree
-            """try:
-                remote.send((None, None))
-            except:
-                break"""
             break
 
 

@@ -1,26 +1,31 @@
-from core import initial_policy, sample_self_play, get_random, train_policy
+from core import initial_policy,random_play, sample_self_play, get_random, train_policy
 import args
 from mp import manager, TreeMan
 import torch.multiprocessing as mp
 import torch
 import gc
-from hanging_threads import start_monitoring
+#from hanging_threads import start_monitoring
 
 if __name__ == "__main__":
     ip = initial_policy()
     if args.load:
-        checkpoint = torch.load(args.path)
-        s = checkpoint['samples']
+        checkpoint = torch.load(args.path+"save")
+        d = checkpoint['dataset']
     else:
-        s = []
+        d = [[],[]]
         checkpoint = None
-    try:
-        ip.load_state_dict(checkpoint['model_state_dict'])
-        ip.optimizer.load_state_dict(checkpoint['optim_state_dict'])
-        last_epoch = checkpoint['epoch']
-
-    except:
         last_epoch = 0
+        avgs=[]
+    if checkpoint:
+        try:
+            #raise
+            ip.load_state_dict(checkpoint['model_state_dict'])
+            ip.optimizer.load_state_dict(checkpoint['optim_state_dict'])
+            last_epoch = checkpoint['epoch']
+            avgs=checkpoint['avgs']
+        except:
+            last_epoch = 0
+            avgs=[]
     del checkpoint
 
     if args.gpu:
@@ -28,43 +33,66 @@ if __name__ == "__main__":
     print(f"Starting from {last_epoch}")
     acs = []
     mn = mp.Manager()
-    results = mn.list([None]*args.samplesperbatch)
-    states = mn.list()
-    for i in range(args.loops):  # last_epoch, last_epoch+args.loops):
+    lock=mn.Lock()
+    results = mn.list()
+    if not args.load:
+        m = manager(args.nenvs, args.seed, args.render)
+        state=random_play(m)
+        s=state
         try:
-            m = manager(args.nenvs, args.seed, args.render, states)
+            tm = TreeMan(None, args.ntrees, state, results,args.tree_iterations//10,lock, args.render)
+            tm.run()
+            state, acs = zip(*results)
+            del results[:]
+            d[0].extend(state)
+            d[1].extend(acs)
+            loss = train_policy(*d,ip)
+            print(f"Init ended, {loss=}")
+        except:
+            print("init failed")
+            torch.save({'dataset':d}, args.path+"save")
+            raise
+    for it in range(last_epoch, last_epoch+args.loops):
+        try:
+            m = manager(args.nenvs, args.seed, args.render)
 
-            s += sample_self_play(ip, m)
-            ds, state = get_random(s, args.samplesperbatch)
-            print("tree", end=" ", flush=True)
-            sm = start_monitoring(20, 1000)
-            tm = TreeMan(ip, args.ntrees, state, results,
-                         args.tree_iterations, args.render)
-            while tm.remotes:
-                tm.recv()
-            sm.stop()
+            if not(args.load and it==0 and len(d)>=args.samplesperbatch):
+                state = sample_self_play(ip, m)
+                avg=m.lines/m.count if m.count else 0
+                print(f"average lines: {avg:.3f}")
+                avgs.append(avg)
+            #sm = start_monitoring(20, 1000)
+            tm = TreeMan(ip, args.ntrees, state, results,args.tree_iterations,lock, args.render and it%1==0)
+            tm.run()
+            with lock:
+                state, acs = zip(*results)
+                del results[:]
+            d[0].extend(state)
+            d[1].extend(acs)
 
-            tm.close()
-            loss = train_policy(ds, list(results), ip)
-            print(f"Loop {i} ended, {loss=}")
-            del s[:int(len(s)-args.max_record)]
-            save = {'samples': s}
+            ds=get_random(d,args.samplesperbatch)
+            loss = train_policy(*ds,ip)
+            print(f"Loop {it} ended, {loss=}")
+            for i in range(2):
+                del d[i][:int(len(d[i])-args.max_record)]
+            save = {'dataset': d}
             if not args.debug:
                 save.update({
-                    'epoch': i,
+                    'epoch': it,
+                    'avgs': avgs,
                     'model_state_dict': ip.state_dict(),
                     'optim_state_dict': ip.optimizer.state_dict(),
                 })
-            torch.save(save, args.path)
-            gc.collect()
-        except KeyboardInterrupt as e:
-            if len(s):
-                save = {'samples': s}
-            if not args.debug and i > 0:
-                save.update({
-                    'epoch': i,
-                    'model_state_dict': ip.state_dict(),
-                    'optim_state_dict': ip.optimizer.state_dict(),
-                })
-            torch.save(save, args.path)
-            raise e
+            torch.save(save, args.path+"save")
+        except:
+            if len(d):
+                save = {'dataset': d}
+                if not args.debug and it > 0:
+                    save.update({
+                        'epoch': it,
+                        'avgs':avgs,
+                        'model_state_dict': ip.state_dict(),
+                        'optim_state_dict': ip.optimizer.state_dict(),
+                    })
+                torch.save(save, args.path+"errorsave")
+            raise
