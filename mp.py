@@ -28,7 +28,7 @@ class manager:
         self.data=Array("d",500*self.nenvs,lock=False)
         self.remotes, self.work_remotes = zip(
             *[Pipe() for _ in range(self.nremotes)])
-        self.ps = [Process(target=gather_data, args=(work_remote, remote, seeds, self.q, seeds == 0 & render,self.lock,self.data,seed))
+        self.ps = [Process(target=gather_data, args=(work_remote, remote, seeds, self.q, (seeds == 0) & render,self.lock,self.data,seed))
                    for work_remote, remote, seeds in zip(self.work_remotes, self.remotes, env_seeds)]
         for p in self.ps:
             p.daemon = True
@@ -226,20 +226,22 @@ class TreeMan:
             self.nenvs = 1
         self.nremotes = min(self.nenvs, len(to_process))
         print(self.nremotes,"workers")
+        self.q =results
         self.data=Array("d",500*self.nremotes,lock=False)
         self.trees = [MCTS(i,render,self.data,results,lock)
                       for i in range(self.nremotes)]
         env_trees = self.trees  # np.array_split(self.trees, self.nremotes)
         # np.array_split(states, self.nremotes)
-        self.q =results
-        self.remotes, self.work_remotes = zip(
-        *[Pipe() for _ in range(self.nremotes)])
-        self.ps = [Process(target=tree_gather, args=(work_remote, remote, tree,states,self.q, budget,self.nn==None))
-            for work_remote, remote, tree, states in zip(self.work_remotes, self.remotes, env_trees, to_process)]
-        for p in self.ps:
+        self.remotes, self.work_remotes, self.ps = [], [], []
+        for tree, states in zip(env_trees, to_process):
+            remote, work_remote = Pipe()
+            self.remotes.append(remote)
+            self.work_remotes.append(work_remote)
+            p = Process(target=tree_gather, args=(work_remote, remote, tree, states, self.q, budget, self.nn is None))
+            self.ps.append(p)
             p.start()
+
         self.to_process = to_process[self.nremotes:]
-        self.remotes = list(self.remotes)
         for remote in self.work_remotes:
             remote.close()
         #print("inited", end=" ", flush=True)
@@ -248,7 +250,7 @@ class TreeMan:
             self.recv()
         self.close()
     def recv(self):
-        ready_list = wait(self.remotes, 0.1)
+        ready_list = wait(self.remotes, 1)
         if not ready_list:
             return
         try:
@@ -264,17 +266,57 @@ class TreeMan:
         finalize: list of states,None
         done: None,None
         """
-        finalize_indices = [i for i, mask in enumerate(masks) if mask is None]
-        process_indices = [i for i, mask in enumerate(masks) if mask is not None]
+        state_batch = []
+        masks_to_process = []
+        remotes_to_process = []
 
-        if process_indices:
-            states_to_process = [states[i] for i in process_indices]
-            masks_to_process = [masks[i] for i in process_indices]
-            remotes_to_process = [ready_list[i] for i in process_indices]
+        batch_indices = []
+        batched_states = []
 
+        for i, (state, mask) in enumerate(zip(states, masks)):
+            if mask is None:
+                if isinstance(state, list):
+                    batch_indices.append(i)
+                    batched_states.extend(state)
+                else:
+                    if self.to_process:  # args.samplesperbatch > len(self.q) + 1 and
+                        ready_list[i].send(self.to_process.pop(0))
+                    else:
+                        ready_list[i].send(None)
+                        ready_list[i].close()
+                        idx = self.remotes.index(ready_list[i])
+                        del self.remotes[idx]
+                        self.ps[idx].join()
+                        del self.ps[idx]
+                        #print(f"{len(self.q)}/{args.samplesperbatch}", end=" ", flush=True)
+            else:
+                state_batch.append(self.data[states[i] * 500:(states[i] + 1) * 500])
+                masks_to_process.append(mask)
+                remotes_to_process.append(ready_list[i])
+        # Process the batched states all at once if there are any
+        if batched_states:
+            with no_grad():
+                results = self.nn(batched_states, p2=True, loss=True)
+                results = [x.cpu().numpy() for x in results]  # Convert results to numpy arrays
+
+            array1, array2 = results  # Unpack the tuple
+            i = 0
+
+            for idx, l in zip(batch_indices, map(len, (states[idx] for idx in batch_indices))):
+                # Slice the results for the current batch
+                slice_array1 = array1[i:i + l]
+                slice_array2 = array2[i:i + l]
+
+                # Combine the sliced arrays into a tuple
+                result_slice = (slice_array1, slice_array2)
+
+                # Send the result slice
+                ready_list[idx].send(result_slice)
+
+                # Update index for the next batch
+                i += l
+        if state_batch:
             mask_batch = np.stack(masks_to_process, axis=0)
-            state_batch = [self.data[s*500:(s+1)*500] for s in states_to_process]
-
             with no_grad():
                 acs = self.nn(state_batch, p2=True, mask=mask_batch)
                 acs = acs.detach()
@@ -284,23 +326,6 @@ class TreeMan:
 
             for remote, ac in zip(remotes_to_process, acs):
                 remote.send(ac)
-        # Process finalized states
-        for i in finalize_indices:
-            if isinstance(states[i], list):
-                with no_grad():
-                    result = self.nn(states[i], p2=True, loss=True)
-                    ready_list[i].send(tuple(map(lambda x: x.cpu().numpy(), result)))
-            else:
-                if self.to_process:#args.samplesperbatch > len(self.q) + 1 and
-                    ready_list[i].send(self.to_process.pop(0))
-                else:
-                    ready_list[i].send(None)
-                    ready_list[i].close()
-                    idx=self.remotes.index(ready_list[i])
-                    del self.remotes[idx]
-                    self.ps[idx].join()
-                    del self.ps[idx]
-            print(f"{len(self.q)}/{args.samplesperbatch}", end=" ", flush=True)
 
     def close(self):
         for p in self.ps:

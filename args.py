@@ -4,7 +4,7 @@ import pathlib
 path = f"{pathlib.Path().absolute()}/"
 debug = 0
 load = 1
-render = 1
+render = 0
 gpu = True # not debug
 #ob_space = (1476,)
 action_space = 10
@@ -15,7 +15,7 @@ ntrees = nenvs
 
 total_timesteps = 1e9
 
-samplesperbatch = 8 if debug else nenvs*2
+samplesperbatch = 8 if debug else nenvs
 tree_iterations = 10 if debug else int(10000)
 max_record = int(1e5)
 

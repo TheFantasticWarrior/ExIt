@@ -37,11 +37,12 @@ def sample_self_play(ip, m):
 
 def get_random(ds, l):
     state=ds[0].copy()
+    l=min(l,len(state))
     acs=ds[1].copy()
     np.random.shuffle(state)
     np.random.shuffle(acs)
 
-    return state,acs
+    return state[:l],acs[:l]
 
 def train_policy(s, acs, ip):
     neglogpx, neglogpy = ip(s, p2=True, loss=True)

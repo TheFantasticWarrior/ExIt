@@ -112,7 +112,12 @@ class BoardModel(nn.Module):
         board=torch.zeros((batch_size,3,21,10),device=torch.device("cuda"))
         board[:,0] = t[:, 22:232].view(batch_size, 21, 10)
         #draw ghost and shadow
-
+        if torch.any(t[:,8]>6) or torch.any(t[:,8]<0):
+            print(t[:,8])
+            breakpoint()
+        if torch.any(t[:,4]>3) or torch.any(t[:,4]<0):
+            print(t[:,4])
+            breakpoint()
         pieces=self.p[t[:,8].int(),t[:,4].int()]
         a,y,x=torch.where(pieces)
         x+=torch.repeat_interleave(t[:,1].int(),4)-2
@@ -173,7 +178,7 @@ class Model(nn.Module):
         #    ns) else torch.repeat_interleave(torch.Tensor([0]), len(x)), True)
 
         own[..., 0] = sum_atk
-        opp[..., 0] = -own[..., 0]
+        opp[..., 0] = -sum_atk
         atk = torch.unsqueeze(torch.tensor(atk, dtype=torch.float), -1)
         #print(torch.squeeze(atk))
         own = torch.tensor(own, dtype=torch.float)

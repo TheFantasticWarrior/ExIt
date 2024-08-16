@@ -47,7 +47,7 @@ if __name__ == "__main__":
             d[0].extend(state)
             d[1].extend(acs)
             loss = train_policy(*d,ip)
-            print(f"Init ended, {loss=}")
+            print(f"Init ended, {loss=:.2f}")
         except:
             print("init failed")
             torch.save({'dataset':d}, args.path+"save")
@@ -62,7 +62,7 @@ if __name__ == "__main__":
                 print(f"average lines: {avg:.3f}")
                 avgs.append(avg)
             #sm = start_monitoring(20, 1000)
-            tm = TreeMan(ip, args.ntrees, state, results,args.tree_iterations,lock, args.render and it%1==0)
+            tm = TreeMan(ip, args.ntrees, state, results,args.tree_iterations//10*min(it,10),lock, args.render and it%1==0)
             tm.run()
             with lock:
                 state, acs = zip(*results)
@@ -70,15 +70,15 @@ if __name__ == "__main__":
             d[0].extend(state)
             d[1].extend(acs)
 
-            ds=get_random(d,args.samplesperbatch)
+            ds=get_random(d,args.samplesperbatch*8)
             loss = train_policy(*ds,ip)
-            print(f"Loop {it} ended, {loss=}")
+            print(f"Loop {it} ended, {loss=}, dataset length={len(d[0])}")
             for i in range(2):
                 del d[i][:int(len(d[i])-args.max_record)]
             save = {'dataset': d}
             if not args.debug:
                 save.update({
-                    'epoch': it,
+                    'epoch': it+1,
                     'avgs': avgs,
                     'model_state_dict': ip.state_dict(),
                     'optim_state_dict': ip.optimizer.state_dict(),

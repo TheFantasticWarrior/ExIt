@@ -5,7 +5,7 @@ import args
 
 np.set_printoptions(precision=3,suppress=True)
 
-lose_rew=-25
+lose_rew=-10
 class Node:
     def __init__(self, state, parent=None, depth=0):
         if type(state) == tetris.Container:
@@ -39,9 +39,10 @@ class Node:
         self.update(reward1, reward2)
         if self.parent is None:
             return
-        self.parent().update(reward1*0.99,reward2*0.99)
+        self.parent().backpropagate(reward1*0.99,reward2*0.99)
     def set_invalid(self,ac,ind):
-        self.children[ac if ind==0 else slice(None), ac]=False
+        self.children[ac if ind==0 else slice(None),
+                      ac if ind==1 else slice(None)]=False
     def expand(self,x,y):
         new_state = self.state.copy()
         #print("copied",x,y,type(x),type(y),new_state)
@@ -147,8 +148,11 @@ class MCTS:
         self.r =tetris.Renderer(1,10) if self.rendering else None
         for it in range(budget):
             leaf,acs = self.traverse(self.root)
-            simulation_reward,depth = self.rollout(leaf.state, acs,leaf.depth)
-            leaf.backpropagate(*simulation_reward)
+            if not leaf.is_terminal:
+                simulation_reward,depth = self.rollout(leaf.state, acs,leaf.depth)
+                leaf.backpropagate(*simulation_reward)
+            else:
+                leaf.parent().backpropagate(leaf.reward1,leaf.reward2)
             """
             if depth-leaf.depth<5 and args.debug and it>20:
                 print(depth-leaf.depth)
@@ -183,7 +187,7 @@ class MCTS:
                     if x.any() else 0 for x in self.root.children.T])
             with self.lock:
                 self.results.append((self.root.state.get_state(),result))
-        print(f"reward p1={self.root.reward1/self.root.visits:.3f} p2={self.root.reward2/self.root.visits:.3f}")
+        #print(f"reward p1={self.root.reward1/self.root.visits:.3f} p2={self.root.reward2/self.root.visits:.3f}")
         if (first and self.remote):
             self.finalize(budget//10)
         else:
@@ -251,12 +255,16 @@ class MCTS:
         while not is_terminal:
             depth += 1
             x = state.get_state()
+
             r,w,l=calc_rew(x,actions)
+
             reward+=r
             is_terminal=w or l
             if not is_terminal:
                 if self.remote:
                     self.data[:]=x
+
+
                     self.remote.send((self.i,np.tile(True,(10,10))))
                     actions = self.remote.recv()
                 else:
@@ -298,12 +306,12 @@ class MCTS:
         #print(rews.std(-1))
         #nadv=adv/adv.std(-1,keepdims=True)
         mask = np.nanmax(np.nanstd(rews,-1),-1) #np.max(nadv, axis=(1,2)) > 2
-        keep.extend(np.array(nodes)[not_all_nan][mask>1.5])
-        adv=(rews-np.nanmean(rews,axis=-1,keepdims=True))[mask>1.5]
+        keep.extend(np.array(nodes)[not_all_nan][mask>0.7])
+        adv=(rews-np.nanmean(rews,axis=-1,keepdims=True))[mask>0.7]
 
 
         if not keep:
-            #print(f"nothing to keep, max: {np.nanmax(mask):.1f}")
+            print(f"nothing to keep, max: {np.nanmax(mask):.2f}")
             del self.root
             return
             #raise Exception("filter too high")
@@ -311,7 +319,7 @@ class MCTS:
         p1,p2=self.remote.recv()
         interest=np.nanmax(np.array((np.nansum(adv[:,0]*p1,-1),np.nansum(adv[:,1]*p2,-1))),0)
         print(f"{interest=}")
-        selection=np.array(keep)[interest>3.5]
+        selection=np.array(keep)[interest>0.5]
         #print(f"{len(selection)} interesting states")
         del keep,self.root
         for sel in selection:
