@@ -3,9 +3,9 @@ import tetris
 import weakref
 import args
 
-np.set_printoptions(precision=3,suppress=True)
+np.set_printoptions(precision=3)#,suppress=True)
 
-lose_rew=-10
+lose_rew=args.lose_rew
 class Node:
     def __init__(self, state, parent=None, depth=0):
         if type(state) == tetris.Container:
@@ -32,9 +32,9 @@ class Node:
             self.children[ac] = child
 
     def update(self, reward1, reward2):
+        self.reward1 = self.reward1/max(self.visits,1)+reward1
+        self.reward2 = self.reward2/max(self.visits,1)+reward2
         self.visits += 1
-        self.reward1 += reward1
-        self.reward2 += reward2
     def backpropagate(self, reward1, reward2):
         self.update(reward1, reward2)
         if self.parent is None:
@@ -59,12 +59,14 @@ class Node:
             self.set_invalid(y,1)
         if valid:
             self.add_child((x, y), new_state)
-            r,w,l=calc_rew(s,(x,y))
+            filled=new_state.check_filled()
+            r,w,l=calc_rew(s,(x,y),filled)
+
             self.children[x, y].is_terminal=w or l
             self.children[x, y].backpropagate(*r)
 
             return self.children[x, y]
-    def best_child(self, c_param=10):
+    def best_child(self, c_param=0.2):
         if self.visits==0:
             raise ValueError
         sum_r1 = np.zeros(10)
@@ -97,8 +99,8 @@ class Node:
         sum_p1[valid_indices_p1] = np.maximum(sum_p1[valid_indices_p1], 1)
         sum_p2[valid_indices_p2] = np.maximum(sum_p2[valid_indices_p2], 1)
 
-        ucb1 = (sum_r1 / sum_p1) + c_param * np.sqrt((2 * np.log(self.visits) / sum_p1))
-        ucb2 = (sum_r2 / sum_p2) + c_param * np.sqrt((2 * np.log(self.visits) / sum_p2))
+        ucb1 = (sum_r1 / sum_p1) + c_param * np.sqrt(( np.log(self.visits) / sum_p1))
+        ucb2 = (sum_r2 / sum_p2) + c_param * np.sqrt(( np.log(self.visits) / sum_p2))
 
         # Find the index of the maximum UCB value among valid indices
         try:
@@ -110,11 +112,13 @@ class Node:
         #print(sum_r1,sum_r2,best_move_p1,best_move_p2)
         return (best_move_p1, best_move_p2)
     def sumr(self):
+
         r1 = np.array([np.nanmean([c.reward1/c.visits for c in x if c])
              if x.any() else np.nan for x in self.children])
 
         r2 = np.array([np.nanmean([c.reward2/c.visits for c in x if c])
              if x.any() else np.nan for x in self.children.T])
+
         return r1,r2
 
     def collect_nodes(self):
@@ -251,12 +255,17 @@ class MCTS:
     def rollout(self, state,actions, depth):
         is_terminal = False
         reward = np.array([0., 0.])
-
+        init_depth=depth
         while not is_terminal:
             depth += 1
-            x = state.get_state()
 
-            r,w,l=calc_rew(x,actions)
+            x = state.get_state()
+            if x[8]<0 or x[8]>6:
+                print("depth=",depth-init_depth,x)
+                print(lastx)
+            lastx=x
+            filled=state.check_filled()
+            r,w,l=calc_rew(x,actions,filled)
 
             reward+=r
             is_terminal=w or l
@@ -288,7 +297,6 @@ class MCTS:
                 self.r=None
     def finalize(self,budget=None):
         if not budget:
-            print("no budget")
             del self.root
             return
         keep=[]
@@ -297,7 +305,7 @@ class MCTS:
         all_rew = np.array([node.sumr() if np.any(node.children) else np.tile(np.nan,(2,10)) for node in nodes])
         not_all_nan=np.where(np.count_nonzero(~np.isnan(all_rew),(1,2))>2)
         if not np.any(not_all_nan):
-            print("nothing to keep")
+            #print("nothing to keep")
             del self.root
             return
 
@@ -306,39 +314,42 @@ class MCTS:
         #print(rews.std(-1))
         #nadv=adv/adv.std(-1,keepdims=True)
         mask = np.nanmax(np.nanstd(rews,-1),-1) #np.max(nadv, axis=(1,2)) > 2
-        keep.extend(np.array(nodes)[not_all_nan][mask>0.7])
-        adv=(rews-np.nanmean(rews,axis=-1,keepdims=True))[mask>0.7]
+        #print(f"max: {np.nanmax(mask):.2f}")
+
+        keep.extend(np.array(nodes)[not_all_nan][mask>1.5])
+        adv=(rews-np.nanmean(rews,axis=-1,keepdims=True))[mask>1.5]
 
 
         if not keep:
-            print(f"nothing to keep, max: {np.nanmax(mask):.2f}")
+            #print(f"nothing to keep, max: {np.nanmax(mask):.2f}")
             del self.root
             return
             #raise Exception("filter too high")
         self.remote.send(([k.state.get_state() for k in keep],None))
         p1,p2=self.remote.recv()
         interest=np.nanmax(np.array((np.nansum(adv[:,0]*p1,-1),np.nansum(adv[:,1]*p2,-1))),0)
-        print(f"{interest=}")
-        selection=np.array(keep)[interest>0.5]
+        #print(f"{interest=}")
+        selection=np.array(keep)[interest>3.5]
         #print(f"{len(selection)} interesting states")
         del keep,self.root
         for sel in selection:
             sel.parent=None
             self.search(sel,results=self.results,remote=self.remote,budget=budget)
 
-def calc_rew(x,actions):
+def calc_rew(x,actions,filled):
 
     lose = (x[0] == 127)
     win = (x[0] == 126)
     is_terminal = win or lose
 
-    reward=np.array((0.,0.))
+    reward=np.array(filled)
+    reward=np.minimum(reward,0.7)*0.6
     for i, (r,g) in enumerate(((x[0], x[5]),(x[232],x[237]))):
         if r < 125:
             lines = (r % 10)//2
             atk = r//10
             # hard drop without breaking b2b or spin
-            reward[i] += (0.05 if actions[i] ==1
+            reward[i] += (0.01 if actions[i] ==1
                           else (0.2 if x[i*232+8] == 5 else 0.1))*(r % 2)
             # t spin, regular, tetris
             reward[i] += ((1 if atk >= lines*2+2 and lines <4

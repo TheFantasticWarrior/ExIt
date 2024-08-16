@@ -10,11 +10,11 @@ if __name__ == "__main__":
     ip = initial_policy()
     if args.load:
         checkpoint = torch.load(args.path+"save")
-        d = checkpoint['dataset']
+        d = [[],[]] if args.reset_dataset else checkpoint['dataset']
     else:
         d = [[],[]]
         checkpoint = None
-        last_epoch = 0
+        last_epoch = 1
         avgs=[]
     if checkpoint:
         try:
@@ -24,7 +24,8 @@ if __name__ == "__main__":
             last_epoch = checkpoint['epoch']
             avgs=checkpoint['avgs']
         except:
-            last_epoch = 0
+            print("Can't load model")
+            last_epoch = 1
             avgs=[]
     del checkpoint
 
@@ -48,7 +49,7 @@ if __name__ == "__main__":
             d[1].extend(acs)
             loss = train_policy(*d,ip)
             print(f"Init ended, {loss=:.2f}")
-        except:
+        except Exception:
             print("init failed")
             torch.save({'dataset':d}, args.path+"save")
             raise
@@ -65,16 +66,16 @@ if __name__ == "__main__":
             tm = TreeMan(ip, args.ntrees, state, results,args.tree_iterations//10*min(it,10),lock, args.render and it%1==0)
             tm.run()
             with lock:
-                state, acs = zip(*results)
+                state, acs = map(list,zip(*results))
                 del results[:]
-            d[0].extend(state)
-            d[1].extend(acs)
 
             ds=get_random(d,args.samplesperbatch*8)
-            loss = train_policy(*ds,ip)
-            print(f"Loop {it} ended, {loss=}, dataset length={len(d[0])}")
+            d[0]+=state
+            d[1]+=acs
+            loss = train_policy(ds[0]+state,ds[1]+acs,ip)
             for i in range(2):
-                del d[i][:int(len(d[i])-args.max_record)]
+                del d[i][:len(d[i]) - args.max_record]
+            print(f"Loop {it} ended, {loss=:.3f}, dataset length={len(d[0])}")
             save = {'dataset': d}
             if not args.debug:
                 save.update({
