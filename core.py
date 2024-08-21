@@ -1,17 +1,18 @@
-from model import Model
+from models.modelv4 import ModelWrapper
 import args
 import numpy as np
-from torch import no_grad
+import torch
 import tetris
 
 
 def initial_policy():
     x=tetris.Container()
     a=x.get_shapes()
-    return Model(a)
+    b=x.get_state()
+    return ModelWrapper(a,torch.tensor([b], dtype=torch.int,device=torch.device("cuda")))
 
 def random_play(m):
-    while len(m.q) < args.samplesperbatch:
+    while len(m.q) < 1000:
         m.recv()
         m.send(np.random.randint(10,size=(args.nenvs,2)))
     m.close()
@@ -19,16 +20,14 @@ def random_play(m):
     del m.q[:]
     return states
 
-def sample_self_play(ip, m):
-    while len(m.q) < args.samplesperbatch:
+def sample_self_play(ip, m,samplesperbatch):
+    while len(m.q) < samplesperbatch:
         m.recv()
-        with no_grad():
-            acs = ip(np.array(m.data).reshape(-1,500), p2=True)
-        acs = acs.detach()
-        if args.gpu:
-            acs = acs.cpu()
-        acs = acs.numpy()
-        m.send(acs)
+        with torch.no_grad():
+
+            acs = ip(torch.tensor(np.array(m.data).reshape(-1,500), dtype=torch.int,device=torch.device("cuda")), p2=True)
+        acs=acs.cpu().numpy()
+        m.send(acs.argmax(-1))
     m.close()
     states = m.q[:]
     del m.q[:]

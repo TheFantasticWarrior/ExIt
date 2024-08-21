@@ -7,7 +7,7 @@ from torch.multiprocessing import Pipe, Process,Manager,Array
 from tree import MCTS
 from torch import no_grad
 import args
-
+import gc
 
 class manager:
     def __init__(self, nenvs, seed, render) -> None:
@@ -122,7 +122,7 @@ class envc:
             self.states.append(self.x.copy())
             for i in range(2):
                 r=x[232*i]
-                self.total_lines[i]+=(r % 10)//2 if r!=125 else 0
+                self.total_lines[i]+=(r % 15)//3 if r!=125 else 0
             """
             for i, (r,g) in enumerate(((x[0], x[232]),(x[5],x[237]))):
                 if r != 125:
@@ -215,7 +215,7 @@ def gather_data(remote, parent_remote, i, q, render,lock,data,seed):
 
 
 class TreeMan:
-    def __init__(self, nn, nenvs, to_process, results,budget,lock,render=False) -> None:
+    def __init__(self, nn, nenvs, to_process, results,explore_constant,lock,render=False) -> None:
         cpus = mp.cpu_count()
         self.nn = nn
         try:
@@ -228,7 +228,7 @@ class TreeMan:
         print(self.nremotes,"workers")
         self.q =results
         self.data=Array("d",500*self.nremotes,lock=False)
-        self.trees = [MCTS(i,render,self.data,results,lock)
+        self.trees = [MCTS(i,render,self.data,explore_constant,results,lock)
                       for i in range(self.nremotes)]
         env_trees = self.trees  # np.array_split(self.trees, self.nremotes)
         # np.array_split(states, self.nremotes)
@@ -237,10 +237,10 @@ class TreeMan:
             remote, work_remote = Pipe()
             self.remotes.append(remote)
             self.work_remotes.append(work_remote)
-            p = Process(target=tree_gather, args=(work_remote, remote, tree, states, self.q, budget, self.nn is None))
+            p = Process(target=tree_gather, args=(work_remote, remote, tree, states, self.q, self.nn is None))
             self.ps.append(p)
             p.start()
-
+        self.total=len(to_process)
         self.to_process = to_process[self.nremotes:]
         for remote in self.work_remotes:
             remote.close()
@@ -254,92 +254,71 @@ class TreeMan:
         if not ready_list:
             return
         try:
-            x=zip(*[remote.recv() for remote in ready_list])
-        except:
-            self.remotes=[]
+            x=[remote.recv() for remote in ready_list]
+        except Exception as e:
+            # Log the exception for debugging
+            print(f"Exception occurred: {e}")
+            self.remotes = []
             return
         if x is None:
             return
-        states,masks =map(list,x)
+        states =list(x)
         """
-        normal: index of tree,mask
-        finalize: list of states,None
-        done: None,None
+        normal: index of tree
+        finalize: list of states
+        done: None
         """
         state_batch = []
-        masks_to_process = []
-        remotes_to_process = []
+        lengths = []
 
-        batch_indices = []
-        batched_states = []
 
-        for i, (state, mask) in enumerate(zip(states, masks)):
-            if mask is None:
-                if isinstance(state, list):
-                    batch_indices.append(i)
-                    batched_states.extend(state)
+        for i, state in enumerate(states):
+            if state is None:
+                lengths.append(None)
+                if self.to_process:  # args.samplesperbatch > len(self.q) + 1 and
+                    ready_list[i].send(self.to_process.pop(0))
                 else:
-                    if self.to_process:  # args.samplesperbatch > len(self.q) + 1 and
-                        ready_list[i].send(self.to_process.pop(0))
-                    else:
-                        ready_list[i].send(None)
-                        ready_list[i].close()
-                        idx = self.remotes.index(ready_list[i])
-                        del self.remotes[idx]
-                        self.ps[idx].join()
-                        del self.ps[idx]
-                        #print(f"{len(self.q)}/{args.samplesperbatch}", end=" ", flush=True)
+                    ready_list[i].send(None)
+                    ready_list[i].close()
+                    idx = self.remotes.index(ready_list[i])
+                    del self.remotes[idx]
+                    self.ps[idx].join()
+                    self.ps[idx].close()
+                    del self.ps[idx]
+                if len(self.q)%500==0:
+                    print(f"{len(self.q)}/{self.total}", end=" ", flush=True)
+            elif isinstance(state, list):
+                lengths.append(len(state))
+                state_batch.extend(state)
             else:
+                lengths.append(1)
                 state_batch.append(self.data[states[i] * 500:(states[i] + 1) * 500])
-                masks_to_process.append(mask)
-                remotes_to_process.append(ready_list[i])
         # Process the batched states all at once if there are any
-        if batched_states:
-            with no_grad():
-                results = self.nn(batched_states, p2=True, loss=True)
-                results = [x.cpu().numpy() for x in results]  # Convert results to numpy arrays
-
-            array1, array2 = results  # Unpack the tuple
-            i = 0
-
-            for idx, l in zip(batch_indices, map(len, (states[idx] for idx in batch_indices))):
-                # Slice the results for the current batch
-                slice_array1 = array1[i:i + l]
-                slice_array2 = array2[i:i + l]
-
-                # Combine the sliced arrays into a tuple
-                result_slice = (slice_array1, slice_array2)
-
-                # Send the result slice
-                ready_list[idx].send(result_slice)
-
-                # Update index for the next batch
-                i += l
         if state_batch:
-            mask_batch = np.stack(masks_to_process, axis=0)
             with no_grad():
-                acs = self.nn(state_batch, p2=True, mask=mask_batch)
-                acs = acs.detach()
-                if args.gpu:
-                    acs = acs.cpu()
-                acs = acs.numpy().reshape(-1, 2)
+                acs = self.nn(torch.tensor(np.array(state_batch), dtype=torch.int,device=torch.device("cuda")), p2=True)
+            acs = acs.cpu().numpy()
 
-            for remote, ac in zip(remotes_to_process, acs):
-                remote.send(ac)
+            start=0
+            for i,l in enumerate(lengths):
+                if i:
+                    ready_list[i].send(acs[start:start+l])
+                    start+=l
 
     def close(self):
         for p in self.ps:
             p.join()
         print()
 
-def tree_gather(remote, parent_remote, tree,states, q, budget,rand):
+def tree_gather(remote, parent_remote, tree,states, q,rand):
     parent_remote.close()
     while True:
         if rand:
-            tree.search(states, q, None, budget)
+            tree.search(states, q, None)
         else:
-            tree.search(states, q, remote, budget)
-        remote.send((None,None))
+            tree.search(states, q, remote)
+        gc.collect()
+        remote.send(None)
         states = remote.recv()
 
         if not states:

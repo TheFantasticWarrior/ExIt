@@ -1,25 +1,26 @@
 import pathlib
 
 
-path = f"{pathlib.Path().absolute()}/"
+path = f"{pathlib.Path().absolute()}/save"
 debug = 0
 load = 1
-reset_dataset=1
-render = 1
+reset_dataset=0
+render = 0
 gpu = True # not debug
 #ob_space = (1476,)
 action_space = 10
 
-seed = 4000
-nenvs = 8 if debug else 128
-ntrees = nenvs
+seed = 5
+nenvs = 8 if debug else 16
+ntrees = 16
 
 total_timesteps = 1e9
 
 samplesperbatch = 8 if debug else nenvs
-tree_iterations = 10 if debug else int(10000)
-max_record = int(1e5)
+init_iterations=1000
+iterations = 10 if debug else int(100000)
+max_record = int(1500)
 
-loops = int(total_timesteps // samplesperbatch // tree_iterations)+1
+loops = 10
 
-lose_rew=-25
+lose_rew=-2.5

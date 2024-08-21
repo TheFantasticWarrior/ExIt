@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import args
-torch.autograd.set_detect_anomaly(True)
+#torch.autograd.set_detect_anomaly(True)
+torch.backends.cudnn.benchmark = True
+#torch.jit.enable_onednn_fusion(True)
+torch.set_float32_matmul_precision("high")
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model):
@@ -31,9 +34,9 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x):
         batch_size=x.size(0)
-        x=self.l(x.view(-1,1)).view(batch_size,-1,self.d_model)
+        x=self.l(x.view(-1,1))
+        x=x.view(batch_size,-1,self.d_model)
         x = self.pos_encoder(x)
-
         x = self.transformer_encoder(x)
         x_mean = x.mean(dim=1)
         x_sum = x.sum(dim=1)
@@ -104,15 +107,15 @@ class LeNet5(nn.Module):
 class BoardModel(nn.Module):
     def __init__(self,piece_shapes):
         super(BoardModel, self).__init__()
-        self.b_cnn = LeNet5()
+        self.b_cnn = LeNet5().to(memory_format=torch.channels_last)
         self.fc = nn.Linear(8, 32)
         self.embedding = nn.Embedding(8,84)
-        self.attn = nn.MultiheadAttention(84,14,batch_first=True)
+        self.attn = nn.MultiheadAttention(84,6,batch_first=True)
         self.pos_encoder = PiecePosition(84)
         self.p=torch.cat((torch.as_tensor(piece_shapes),torch.zeros(1,4,4,4)),0).to(torch.device("cuda"))
     def forward(self, t):
         batch_size=t.size(0)
-        board=torch.zeros((batch_size,3,21,10),device=torch.device("cuda"))
+        board=torch.zeros((batch_size,3,21,10),device=torch.device("cuda")).to(memory_format=torch.channels_last)
         board[:,0] = t[:, 22:232].float().view(batch_size, 21, 10)
         #draw ghost and shadow
         """if torch.any(t[:,8]>6) or torch.any(t[:,8]<0):
@@ -188,18 +191,18 @@ class ImpalaCNN(nn.Module):
 
 
         x = F.relu(self.conv2(x))
-        x=x+c.unsqueeze(-1).unsqueeze(-1).expand(-1,-1,x.size(2),x.size(3))
         x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
         x = self.res2(x)
         x = self.res22(x)
 
 
         x = F.relu(self.conv3(x))
+        x=x+c.unsqueeze(-1).unsqueeze(-1).expand(-1,-1,x.size(2),x.size(3))
         x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
         x = self.res3(x)
         x = self.res32(x)
 
-        x = self.fc(F.relu(x.view(x.size(0), -1)))
+        x = self.fc(F.relu(x.reshape(x.size(0), -1)))
         x=F.softmax(self.fc2(F.relu(x)),-1)
         return x
 
@@ -209,23 +212,14 @@ class Model(nn.Module):
         bm=BoardModel(shapes).to(torch.device("cuda"))
         at=TransformerEncoder(4, 2, 8, 32, 84).to(torch.device("cuda"))
         l=nn.Linear(432,32).to(torch.device("cuda"))
-        cm=ImpalaCNN(3).to(torch.device("cuda"))
-        self.boardm = torch.jit.trace(bm,torch.zeros(1,232,dtype=torch.int,device=torch.device("cuda")))
-        self.atk_trans = torch.jit.trace(at,torch.zeros(1,35,device=torch.device("cuda")),check_trace=False)
-        self.linear0=torch.jit.trace(l,torch.zeros(1,432,device=torch.device("cuda")))
-        self.combined_model=torch.jit.trace(cm,(torch.zeros(1,3,22,12,device=torch.device("cuda")),torch.zeros(1,32,device=torch.device("cuda"))))
-        if args.gpu:
-            self.to(torch.device("cuda"))
-        self.params=self.parameters()
-        self.optimizer = torch.optim.AdamW(self.parameters(), 0.0025)
+        cm=ImpalaCNN(3).to(torch.device("cuda")).to(memory_format=torch.channels_last)
+        self.boardm = bm #torch.jit.trace(bm,torch.zeros(1,232,dtype=torch.int,device=torch.device("cuda")))
+        self.atk_trans = at #torch.jit.trace(at,torch.zeros(1,35,device=torch.device("cuda")))
+        self.linear0=l #torch.jit.trace(l,torch.zeros(1,432,device=torch.device("cuda")))
+        self.combined_model=cm #torch.jit.trace(cm,(torch.zeros(1,3,22,12,device=torch.device("cuda")),torch.zeros(1,32,device=torch.device("cuda"))))
 
-    def forward(self, x, p2: bool = False, loss: bool = False, mask: torch.Tensor = torch.zeros(2,10), fin: bool = False):
 
-        x,atk,y,opp_board=self.base_forward(x)
-        x=self.cond_forward(x,atk,y,opp_board,p2,loss,mask,fin)
-        return x
-
-    def base_forward(self,x):
+    def forward(self,x):
 
         sum_atk=x[...,464]
         atk=x[...,465:]
@@ -237,9 +231,9 @@ class Model(nn.Module):
         opp[..., 0] = -sum_atk
         atk = torch.unsqueeze(atk.float(), -1)
 
-        atk_out = self.atk_trans(atk)
         own_out,own_board = self.boardm(own)
         opp_out,opp_board = self.boardm(opp)
+        atk_out = self.atk_trans(atk)
         x = torch.cat((atk_out, own_out, opp_out), dim=1)
         x = F.relu(self.linear0(x))
         x=self.combined_model(own_board,x)
@@ -295,4 +289,58 @@ class Model(nn.Module):
 
         samples = torch.cat((index1,index2), dim=1)
         return samples[0],samples[1]
+class Model2(nn.Module):
+    def __init__(self,shapes,x):
+        super(Model2, self).__init__()
+        self.base=Model(shapes)
+        self.traced_base=torch.jit.trace(self.base,x)
+    def forward(self, x, p2: bool = False, loss: bool = False, mask: torch.Tensor = torch.zeros(2,10), fin: bool = False):
+
+        x,atk,y,opp_board=self.traced_base(x)
+        x=self.base.cond_forward(x,atk,y,opp_board,p2,loss,mask,fin)
+        return x
+class ModelWrapper:
+    def __init__(self,shapes,x,lr=1e-4,gpu=True):
+        self.model=Model2(shapes,x)
+        if gpu:
+            self.model.to(torch.device("cuda"))
+        self.scripted_model = torch.jit.script(self.model)
+        self.params=list(self.model.parameters())
+        self.optimizer = torch.optim.AdamW(self.params, 1e-4,weight_decay=0.01)
+        self.lr=torch.optim.lr_scheduler.OneCycleLR(self.optimizer,max_lr=1e-3,total_steps=35000)
+
+    def __call__(self,*args,**kwargs):
+        return self.scripted_model(*args,**kwargs)
+    def backward(self, x1, y1, x2, y2,loss_only:bool=False):
+
+        cross1=x1*y1
+        kl1=torch.mean(torch.sum(y1*torch.log(y1)+cross1,-1))
+        if not torch.isfinite(kl1):
+            breakpoint()
+        cross2=x2*y2
+        kl2=torch.mean(torch.sum(y2*torch.log(y2)+cross2,-1))
+        if not torch.isfinite(kl2):
+            breakpoint()
+        if not loss_only:
+            loss = (torch.mean(cross1)+torch.mean(cross2))/2
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.params,1)
+            self.optimizer.step()
+            self.lr.step()
+            self.optimizer.zero_grad(set_to_none=True)
+
+        return ((kl1+kl2)/2).item()
+    def save(self,path="save_model"):
+        torch.save({"model":self.model.base.state_dict(),
+            "optim":self.optimizer.state_dict()},path)
+    def load(self,path="save_model"):
+        checkpoint = torch.load(path)
+        try:
+            self.optimizer.load_state_dict(checkpoint['optim'])
+        except:
+            print("no optimizer state found")
+        try:
+            self.model.base.load_state_dict(checkpoint['model'])
+        except:
+            print("no model state found")
 

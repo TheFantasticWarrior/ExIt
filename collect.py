@@ -99,8 +99,6 @@ if __name__ == "__main__":
                 train_loop(train,test,ip)
 
 
-
-
     del checkpoint
 
     print(f"Starting from {last_epoch}")
@@ -135,16 +133,16 @@ if __name__ == "__main__":
 
     #for it in range(min(last_epoch,1), last_epoch+args.loops):
     it=last_epoch
-    while len(train)<400000:
+    while len(train)<20000:
         it+=1
         try:
             m = manager(args.nenvs, args.seed+it*1200, args.render)
 
-            state = sample_self_play(ip, m,len(train)*0.1)
+            state = sample_self_play(ip, m,1000)
             avg=float(m.lines/m.count) if m.count else 0
             avgs.append(avg)
             print(f"{avg=}")
-            tm = TreeMan(ip, args.ntrees, state, results,0.05,lock, args.render and it%1==0)
+            tm = TreeMan(None, args.ntrees, state, results,0.05,lock, args.render and it%1==0)
             tm.run()
             if not len(results):
                 raise ValueError("no results")
